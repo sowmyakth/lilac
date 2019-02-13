@@ -842,7 +842,6 @@ def build_rpn_model(anchor_stride, anchors_per_location, depth):
 ############################################################
 #  Feature Pyramid Network Heads
 ############################################################
-
 def fpn_classifier_graph(rois, feature_maps, image_shape,
                          pool_size, num_classes, train_bn=True,
                          fc_layers_size=1024):
@@ -890,15 +889,83 @@ def fpn_classifier_graph(rois, feature_maps, image_shape,
     mrcnn_probs = KL.TimeDistributed(KL.Activation("softmax"),
                                      name="mrcnn_class")(mrcnn_class_logits)
 
-    # BBox head
-    # [batch, boxes, num_classes * (dy, dx, log(dh), log(dw))]
-    x = KL.TimeDistributed(KL.Dense(num_classes * 4, activation='linear'),
-                           name='mrcnn_bbox_fc')(shared)
-    # Reshape to [batch, boxes, num_classes, (dy, dx, log(dh), log(dw))]
-    s = K.int_shape(x)
-    mrcnn_bbox = KL.Reshape((s[1], num_classes, 4), name="mrcnn_bbox")(x)
+    return mrcnn_class_logits, mrcnn_probs
 
-    return mrcnn_class_logits, mrcnn_probs, mrcnn_bbox
+
+def fpn_separator_stage(x, stage_number, train_bn=True):
+    ident = 'separator_stage_' + str(stage_number) + '_'
+    x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
+                           name=ident + "conv1")(x)
+    x = KL.TimeDistributed(BatchNorm(),
+                           name=ident + "bn1")(x, training=train_bn)
+    x = KL.Activation('relu')(x)
+
+    x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
+                           name=ident + "conv2")(x)
+    x = KL.TimeDistributed(BatchNorm(),
+                           name=ident + "bn2")(x, training=train_bn)
+    x = KL.Activation('relu')(x)
+
+    x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
+                           name=ident + "conv3")(x)
+    x = KL.TimeDistributed(BatchNorm(),
+                           name=ident + "bn3")(x, training=train_bn)
+    x = KL.Activation('relu')(x)
+
+    x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
+                           name=ident + "conv4")(x)
+    x = KL.TimeDistributed(BatchNorm(),
+                           name=ident + "bn4")(x, training=train_bn)
+    x = KL.Activation('relu')(x)
+
+    x = KL.TimeDistributed(KL.Conv2DTranspose(256, (2, 2), strides=2, activation="relu"),
+                           name=ident + "deconv")(x)
+    x = KL.TimeDistributed(BatchNorm(),
+                           name=ident + "bn_deconv")(x, training=train_bn)
+    x = KL.Activation('relu')(x)
+    return x
+
+
+def fpn_separator_graph(rois, feature_maps,
+                        num_classes, train_bn=True):
+    """Builds the computation graph of the feature pyramid network classifier
+    and regressor heads.
+
+    rois: [batch, num_rois, (y1, x1, y2, x2)] Proposal boxes in normalized
+          coordinates.
+    feature_maps: List of feature maps from different layers of the pyramid,
+                  [P2, P3, P4, P5]. Each has a different resolution.
+    - image_shape: [batch, (shape)]
+    pool_size: The width of the square feature map generated from ROI Pooling.
+    num_classes: number of classes, which determines the depth of the results
+    train_bn: Boolean. Train or freeze Batch Norm layers
+    fc_layers_size: Size of the 2 FC layers
+
+    Returns:
+        logits: [N, NUM_CLASSES] classifier logits (before softmax)
+        probs: [N, NUM_CLASSES] classifier probabilities
+        bbox_deltas: [N, (dy, dx, log(dh), log(dw))] Deltas to apply to
+                     proposal boxes
+    """
+    # ROI Pooling
+    # Shape: [batch, num_boxes, pool_height, pool_width, channels]
+    x = PyramidROIExtract(name="roi_extract")([rois, feature_maps])     # fix this
+
+    x = fpn_separator_stage(x, 1, train_bn=train_bn)
+    x = fpn_separator_stage(x, 2, train_bn=train_bn)
+
+    # Final layer
+    x = KL.TimeDistributed(KL.Conv2DTranspose(256, (2, 2), strides=2,
+                           activation="relu"),
+                           name="separator_stage3_deconv1")(x)
+    x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
+                           name="separator_stage3_conv1")(x)
+    x = KL.TimeDistributed(BatchNorm(),
+                           name='separator_stage3_bn1')(x, training=train_bn)
+    x = KL.Activation('relu')(x)
+    x = KL.TimeDistributed(KL.Conv2D(num_classes, (1, 1), strides=1,
+                           activation="relu"), name="separator_output")(x)
+    return x
 
 
 ############################################################
@@ -913,6 +980,15 @@ def smooth_l1_loss(y_true, y_pred):
     less_than_one = K.cast(K.less(diff, 1.0), "float32")
     loss = (less_than_one * 0.5 * diff**2) + (1 - less_than_one) * (diff - 0.5)
     return loss
+
+
+def l2_loss(y_true, y_pred):
+    """Implements l2 loss"""
+    diff = y_true - y_pred
+    loss = K.mean(diff**2) / 2.
+    return loss
+
+# to do, add another loss
 
 
 def rpn_class_loss_graph(rpn_match, rpn_class_logits):
@@ -993,34 +1069,36 @@ def mrcnn_class_loss_graph(target_class_ids, pred_class_logits):
     return loss
 
 
-def mrcnn_bbox_loss_graph(target_bbox, target_class_ids, pred_bbox):
-    """Loss for Mask R-CNN bounding box refinement.
-
-    target_bbox: [batch, num_rois, (dy, dx, log(dh), log(dw))]
-    target_class_ids: [batch, num_rois]. Integer class IDs.
-    pred_bbox: [batch, num_rois, num_classes, (dy, dx, log(dh), log(dw))]
+def mrcnn_separator_loss_graph(target_image, target_class_ids, pred_image):
+    """Mask binary l2 loss for the masks head.
+    target_image: [batch, num_rois, height, width]. Uses zero padding to fill array.
+    target_class_ids: [batch, num_rois]. Integer class IDs. Zero padded.
+    pred_image: [batch, proposals, height, width, num_classes] float32 tensor.
     """
-    # Reshape to merge batch and roi dimensions for simplicity.
+    # Reshape for simplicity. Merge first two dimensions into one.
     target_class_ids = K.reshape(target_class_ids, (-1,))
-    target_bbox = K.reshape(target_bbox, (-1, 4))
-    pred_bbox = K.reshape(pred_bbox, (-1, K.int_shape(pred_bbox)[2], 4))
+    mask_shape = tf.shape(target_image)
+    target_image = K.reshape(target_image, (-1, mask_shape[2], mask_shape[3]))
+    pred_shape = tf.shape(pred_image)
+    pred_image = K.reshape(pred_image,
+                           (-1, pred_shape[2], pred_shape[3], pred_shape[4]))
+    # Permute predicted masks to [N, num_classes, height, width]
+    pred_image = tf.transpose(pred_image, [0, 3, 1, 2])
 
     # Only positive ROIs contribute to the loss. And only
-    # the right class_id of each ROI. Get their indices.
-    positive_roi_ix = tf.where(target_class_ids > 0)[:, 0]
-    positive_roi_class_ids = tf.cast(
-        tf.gather(target_class_ids, positive_roi_ix), tf.int64)
-    indices = tf.stack([positive_roi_ix, positive_roi_class_ids], axis=1)
+    # the class specific mask of each ROI.
+    positive_ix = tf.where(target_class_ids > 0)[:, 0]
+    positive_class_ids = tf.cast(
+        tf.gather(target_class_ids, positive_ix), tf.int64)
+    indices = tf.stack([positive_ix, positive_class_ids], axis=1)
 
-    # Gather the deltas (predicted and true) that contribute to loss
-    target_bbox = tf.gather(target_bbox, positive_roi_ix)
-    pred_bbox = tf.gather_nd(pred_bbox, indices)
+    # Gather the masks (predicted and true) that contribute to loss
+    y_true = tf.gather(target_image, positive_ix)
+    y_pred = tf.gather_nd(pred_image, indices)
 
-    # Smooth-L1 Loss
-    loss = K.switch(tf.size(target_bbox) > 0,
-                    smooth_l1_loss(y_true=target_bbox, y_pred=pred_bbox),
-                    tf.constant(0.0))
-    loss = K.mean(loss)
+    # Compute binary cross entropy. If no positive ROIs, then return 0.
+    # shape: [batch, roi, num_classes]
+    loss = l2_loss(y_true, y_pred)
     return loss
 
 
@@ -1630,11 +1708,14 @@ class MaskRCNN():
 
             # Network Heads
             # TODO: verify that this handles zero padded ROIs
-            mrcnn_class_logits, mrcnn_class, mrcnn_bbox =\
+            mrcnn_class_logits, mrcnn_class =\
                 fpn_classifier_graph(rois, mrcnn_feature_maps, input_image_shape,
                                      config.POOL_SIZE, config.NUM_CLASSES,
                                      train_bn=config.TRAIN_BN,
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
+            mrcnn_image = fpn_separator_graph(rois, mrcnn_feature_maps,
+                                              config.NUM_CLASSES,
+                                              train_bn=config.TRAIN_BN)
 
             # TODO: clean up (use tf.identify if necessary)
             output_rois = KL.Lambda(lambda x: x * 1, name="output_rois")(rois)
@@ -1644,10 +1725,11 @@ class MaskRCNN():
                 [input_rpn_match, rpn_class_logits])
             rpn_bbox_loss = KL.Lambda(lambda x: rpn_bbox_loss_graph(config, *x), name="rpn_bbox_loss")(
                 [input_rpn_bbox, input_rpn_match, rpn_bbox])
-            class_loss = KL.Lambda(lambda x: mrcnn_class_loss_graph(*x), name="mrcnn_class_loss")(
-                [target_class_ids, mrcnn_class_logits])
-            bbox_loss = KL.Lambda(lambda x: mrcnn_bbox_loss_graph(*x), name="mrcnn_bbox_loss")(
-                [target_bbox, target_class_ids, mrcnn_bbox])
+            class_loss = KL.Lambda(
+                lambda x: mrcnn_class_loss_graph(*x), name="mrcnn_class_loss")(
+                    [target_class_ids, mrcnn_class_logits])
+            separator_loss = KL.Lambda(lambda x: mrcnn_separator_loss_graph(*x), name="mrcnn_separator_loss")(
+                [target_image, target_class_ids, mrcnn_image])
             # Model
             inputs = [input_image, input_image_shape,
                       input_rpn_match, input_rpn_bbox, input_gt_class_ids,
@@ -1655,26 +1737,29 @@ class MaskRCNN():
             if not config.USE_RPN_ROIS:
                 inputs.append(input_rois)
             outputs = [rpn_class_logits, rpn_class, rpn_bbox,
-                       mrcnn_class_logits, mrcnn_class, mrcnn_bbox,
+                       mrcnn_class_logits, mrcnn_class, mrcnn_image,
                        rpn_rois, output_rois,
-                       rpn_class_loss, rpn_bbox_loss, class_loss, bbox_loss]
+                       rpn_class_loss, rpn_bbox_loss, class_loss, separator_loss]
             model = KM.Model(inputs, outputs, name='mask_rcnn')
         else:
             # Network Heads
             # Proposal classifier and BBox regressor heads
-            mrcnn_class_logits, mrcnn_class, mrcnn_bbox =\
+            mrcnn_class_logits, mrcnn_class =\
                 fpn_classifier_graph(rpn_rois, mrcnn_feature_maps, input_image_shape,
                                      config.POOL_SIZE, config.NUM_CLASSES,
                                      train_bn=config.TRAIN_BN,
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
+            mrcnn_image = fpn_separator_graph(rois, mrcnn_feature_maps,
+                                              config.NUM_CLASSES,
+                                              train_bn=config.TRAIN_BN)
 
             # Detections
             # output is [batch, num_detections, (y1, x1, y2, x2, class_id, score)] in
             # normalized coordinates
             detections = DetectionLayer(config, name="mrcnn_detection")(
-                [rpn_rois, mrcnn_class, mrcnn_bbox])
+                [rpn_rois, mrcnn_class, mrcnn_image])
             model = KM.Model([input_image, input_image_shape, input_anchors],
-                             [detections, mrcnn_class, mrcnn_bbox,
+                             [detections, mrcnn_class, mrcnn_image,
                               rpn_rois, rpn_class, rpn_bbox],
                              name='mask_rcnn')
 
