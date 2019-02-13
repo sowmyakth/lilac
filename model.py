@@ -451,6 +451,90 @@ class PyramidROIAlign(KE.Layer):
         return input_shape[0][:2] + self.pool_shape + (input_shape[2][-1], )
 
 
+class PyramidROIExtract(KE.Layer):
+    """Implements ROI Pooling on level 2 of the feature pyramid.
+
+    Params:
+    - pool_shape: [height, width] of the output pooled regions. Usually [7, 7]
+
+    Inputs:
+    - boxes: [batch, num_boxes, (y1, x1, y2, x2)] in normalized
+             coordinates. Possibly padded with zeros if not enough
+             boxes to fill the array.
+    - image_shape: [batch, (shape)] Image details
+    - Feature maps: List of feature maps from different levels of the pyramid.
+                    Each is [batch, height, width, channels]
+
+    Output:
+    Pooled regions in the shape: [batch, num_boxes, height, width, channels].
+    The width and height are those specific in the pool_shape in the layer
+    constructor.
+    """
+
+    def __init__(self, pool_shape, **kwargs):
+        super(PyramidROIExtract, self).__init__(**kwargs)
+        self.pool_shape = tuple(pool_shape)
+
+    def call(self, inputs):
+        # Crop boxes [batch, num_boxes, (y1, x1, y2, x2)] in normalized coords
+        boxes = inputs[0]
+
+        # Image shape
+        image_shape = inputs[1]
+
+        # Feature Maps. List of feature maps from different level of the
+        # feature pyramid. Each is [batch, height, width, channels]
+        feature_maps = inputs[2:]
+
+        roi_level = 2
+
+        # Loop through levels and apply ROI pooling to each. P2 to P5.
+        pooled = []
+        box_to_level = []
+        for i, level in enumerate(range(2, 6)):
+            ix = tf.where(tf.equal(roi_level, level))
+            level_boxes = tf.gather_nd(boxes, ix)
+
+            # Box indices for crop_and_resize.
+            box_indices = tf.cast(ix[:, 0], tf.int32)
+
+            # Keep track of which box is mapped to which level
+            box_to_level.append(ix)
+
+            # Stop gradient propogation to ROI proposals
+            level_boxes = tf.stop_gradient(boxes)
+            pooled.append(tf.image.crop_and_resize(
+                feature_maps[0], level_boxes, box_indices, self.pool_shape,
+                method="bilinear"))
+
+        # Pack pooled features into one tensor
+        pooled = tf.concat(pooled, axis=0)
+
+        # Pack box_to_level mapping into one array and add another
+        # column representing the order of pooled boxes
+        box_to_level = tf.concat(box_to_level, axis=0)
+        box_range = tf.expand_dims(tf.range(tf.shape(box_to_level)[0]), 1)
+        box_to_level = tf.concat([tf.cast(box_to_level, tf.int32), box_range],
+                                 axis=1)
+
+        # Rearrange pooled features to match the order of the original boxes
+        # Sort box_to_level by batch then box index
+        # TF doesn't have a way to sort by two columns, so merge them and sort.
+        sorting_tensor = box_to_level[:, 0] * 100000 + box_to_level[:, 1]
+        ix = tf.nn.top_k(sorting_tensor, k=tf.shape(
+            box_to_level)[0]).indices[::-1]
+        ix = tf.gather(box_to_level[:, 2], ix)
+        pooled = tf.gather(pooled, ix)
+
+        # Re-add the batch dimension
+        pooled = tf.expand_dims(pooled, 0)
+        return pooled
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0][:2] + self.pool_shape + (input_shape[2][-1], )
+
+
+
 ############################################################
 #  Detection Target Layer
 ############################################################
@@ -484,21 +568,23 @@ def overlaps_graph(boxes1, boxes2):
     return overlaps
 
 
-def detection_targets_graph(proposals, gt_class_ids, gt_boxes, config):
+def detection_targets_graph(proposals, gt_class_ids, gt_boxes,
+                            gt_images, config):
     """Generates detection targets for one image. Subsamples proposals and
-    generates target class IDs, bounding box deltas for each.
-
+    generates target class IDs, bounding box deltas, and masks for each.
     Inputs:
-    proposals: [N, (y1, x1, y2, x2)] in normalized coordinates. Might
+    proposals: [POST_NMS_ROIS_TRAINING, (y1, x1, y2, x2)] in normalized coordinates. Might
                be zero padded if there are not enough proposals.
     gt_class_ids: [MAX_GT_INSTANCES] int class IDs
     gt_boxes: [MAX_GT_INSTANCES, (y1, x1, y2, x2)] in normalized coordinates.
-
-    Returns: Target ROIs and corresponding class IDs, bounding box shifts.
+    gt_masks: [height, width, MAX_GT_INSTANCES] of boolean type.
+    Returns: Target ROIs and corresponding class IDs, bounding box shifts,
+    and masks.
     rois: [TRAIN_ROIS_PER_IMAGE, (y1, x1, y2, x2)] in normalized coordinates
     class_ids: [TRAIN_ROIS_PER_IMAGE]. Integer class IDs. Zero padded.
-    deltas: [TRAIN_ROIS_PER_IMAGE, NUM_CLASSES, (dy, dx, log(dh), log(dw))]
-            Class-specific bbox refinements.
+    deltas: [TRAIN_ROIS_PER_IMAGE, (dy, dx, log(dh), log(dw))]
+    masks: [TRAIN_ROIS_PER_IMAGE, height, width]. Masks cropped to bbox
+           boundaries and resized to neural network output size.
     Note: Returned arrays might be zero padded if not enough target ROIs.
     """
     # Assertions
@@ -514,31 +600,18 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, config):
     gt_boxes, non_zeros = trim_zeros_graph(gt_boxes, name="trim_gt_boxes")
     gt_class_ids = tf.boolean_mask(gt_class_ids, non_zeros,
                                    name="trim_gt_class_ids")
-
-    # Handle COCO crowds
-    # A crowd box in COCO is a bounding box around several instances. Exclude
-    # them from training. A crowd box is given a negative class ID.
-    crowd_ix = tf.where(gt_class_ids < 0)[:, 0]
-    non_crowd_ix = tf.where(gt_class_ids > 0)[:, 0]
-    crowd_boxes = tf.gather(gt_boxes, crowd_ix)
-    gt_class_ids = tf.gather(gt_class_ids, non_crowd_ix)
-    gt_boxes = tf.gather(gt_boxes, non_crowd_ix)
+    gt_images = tf.gather(gt_images, tf.where(non_zeros)[:, 0], axis=2,
+                          name="trim_gt_images")
 
     # Compute overlaps matrix [proposals, gt_boxes]
     overlaps = overlaps_graph(proposals, gt_boxes)
-
-    # Compute overlaps with crowd boxes [anchors, crowds]
-    crowd_overlaps = overlaps_graph(proposals, crowd_boxes)
-    crowd_iou_max = tf.reduce_max(crowd_overlaps, axis=1)
-    no_crowd_bool = (crowd_iou_max < 0.001)
-
     # Determine positive and negative ROIs
     roi_iou_max = tf.reduce_max(overlaps, axis=1)
     # 1. Positive ROIs are those with >= 0.5 IoU with a GT box
     positive_roi_bool = (roi_iou_max >= 0.5)
     positive_indices = tf.where(positive_roi_bool)[:, 0]
-    # 2. Negative ROIs are those with < 0.5 with every GT box. Skip crowds.
-    negative_indices = tf.where(tf.logical_and(roi_iou_max < 0.5, no_crowd_bool))[:, 0]
+    # 2. Negative ROIs are those with < 0.5 with every GT box.
+    negative_indices = tf.where(roi_iou_max < 0.5)[:, 0]
 
     # Subsample ROIs. Aim for 33% positive
     # Positive ROIs
@@ -548,7 +621,8 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, config):
     positive_count = tf.shape(positive_indices)[0]
     # Negative ROIs. Add enough to maintain positive:negative ratio.
     r = 1.0 / config.ROI_POSITIVE_RATIO
-    negative_count = tf.cast(r * tf.cast(positive_count, tf.float32), tf.int32) - positive_count
+    negative_count = tf.cast(
+        r * tf.cast(positive_count, tf.float32), tf.int32) - positive_count
     negative_indices = tf.random_shuffle(negative_indices)[:negative_count]
     # Gather selected ROIs
     positive_rois = tf.gather(proposals, positive_indices)
@@ -556,28 +630,28 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, config):
 
     # Assign positive ROIs to GT boxes.
     positive_overlaps = tf.gather(overlaps, positive_indices)
-    roi_gt_box_assignment = tf.cond(
+    roi_gt_assignment = tf.cond(
         tf.greater(tf.shape(positive_overlaps)[1], 0),
-        true_fn = lambda: tf.argmax(positive_overlaps, axis=1),
-        false_fn = lambda: tf.cast(tf.constant([]),tf.int64)
+        true_fn=lambda: tf.argmax(positive_overlaps, axis=1),
+        false_fn=lambda: tf.cast(tf.constant([]), tf.int64)
     )
-    roi_gt_boxes = tf.gather(gt_boxes, roi_gt_box_assignment)
-    roi_gt_class_ids = tf.gather(gt_class_ids, roi_gt_box_assignment)
+    roi_gt_class_ids = tf.gather(gt_class_ids, roi_gt_assignment)
 
-    # Compute bbox refinement for positive ROIs
-    deltas = utils.box_refinement_graph(positive_rois, roi_gt_boxes)
-    deltas /= config.BBOX_STD_DEV
+    # Assign positive ROIs to GT masks
+    # Permute masks to [N, height, width, 1]
+    transposed_images = tf.expand_dims(tf.transpose(gt_images, [2, 0, 1]), -1)
+    # Pick the right mask for each ROI
+    roi_images = tf.gather(transposed_images, roi_gt_assignment)
 
-    # Append negative ROIs and pad bbox deltas that
+    # Append negative ROIs and pad bbox deltas and masks that
     # are not used for negative ROIs with zeros.
     rois = tf.concat([positive_rois, negative_rois], axis=0)
     N = tf.shape(negative_rois)[0]
     P = tf.maximum(config.TRAIN_ROIS_PER_IMAGE - tf.shape(rois)[0], 0)
     rois = tf.pad(rois, [(0, P), (0, 0)])
-    roi_gt_boxes = tf.pad(roi_gt_boxes, [(0, N + P), (0, 0)])
     roi_gt_class_ids = tf.pad(roi_gt_class_ids, [(0, N + P)])
-    deltas = tf.pad(deltas, [(0, N + P), (0, 0)])
-    return rois, roi_gt_class_ids, deltas
+    roi_images = tf.pad(roi_images, [[0, N + P], (0, 0), (0, 0)])
+    return rois, roi_gt_class_ids, roi_images
 
 
 class DetectionTargetLayer(KE.Layer):
@@ -610,14 +684,15 @@ class DetectionTargetLayer(KE.Layer):
         proposals = inputs[0]
         gt_class_ids = inputs[1]
         gt_boxes = inputs[2]
+        gt_images = inputs[3]
 
         # Slice the batch and run a graph for each slice
         # TODO: Rename target_bbox to target_deltas for clarity
-        names = ["rois", "target_class_ids", "target_bbox"]
+        names = ["rois", "target_class_ids", "target_image"]
         outputs = utils.batch_slice(
-            [proposals, gt_class_ids, gt_boxes],
-            lambda w, x, y: detection_targets_graph(
-                w, x, y, self.config),
+            [proposals, gt_class_ids, gt_boxes, gt_images],
+            lambda w, x, y, z: detection_targets_graph(
+                w, x, y, z, self.config),
             self.config.IMAGES_PER_GPU, names=names)
         return outputs
 
@@ -625,7 +700,8 @@ class DetectionTargetLayer(KE.Layer):
         return [
             (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),  # rois
             (None, 1),  # class_ids
-            (None, self.config.TRAIN_ROIS_PER_IMAGE, 4)  # deltas
+            (None, self.config.TRAIN_ROIS_PER_IMAGE,
+             self.config.IMAGE_SHAPE[0], self.config.IMAGE_SHAPE[1])  # deltas
         ]
 
     def compute_mask(self, inputs, mask=None):
@@ -1702,7 +1778,7 @@ class MaskRCNN():
             # Subsamples proposals and generates target outputs for training
             # Note that proposal class IDs, gt_boxes are zero
             # padded. Equally, returned rois and targets are zero padded.
-            rois, target_class_ids, target_bbox =\
+            rois, target_class_ids, target_image =\
                 DetectionTargetLayer(config, name="proposal_targets")([
                     target_rois, input_gt_class_ids, gt_boxes])
 
