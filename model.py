@@ -533,11 +533,10 @@ class PyramidROIExtract(KE.Layer):
     def compute_output_shape(self, input_shape):
         return input_shape[0][:2] + self.pool_shape + (input_shape[2][-1], )
 
-
-
 ############################################################
 #  Detection Target Layer
 ############################################################
+
 
 def overlaps_graph(boxes1, boxes2):
     """Computes IoU overlaps between two sets of boxes.
@@ -569,7 +568,7 @@ def overlaps_graph(boxes1, boxes2):
 
 
 def detection_targets_graph(proposals, gt_class_ids, gt_boxes,
-                            gt_images, config):
+                            gt_isolated_images, config):
     """Generates detection targets for one image. Subsamples proposals and
     generates target class IDs, bounding box deltas, and masks for each.
     Inputs:
@@ -600,8 +599,9 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes,
     gt_boxes, non_zeros = trim_zeros_graph(gt_boxes, name="trim_gt_boxes")
     gt_class_ids = tf.boolean_mask(gt_class_ids, non_zeros,
                                    name="trim_gt_class_ids")
-    gt_images = tf.gather(gt_images, tf.where(non_zeros)[:, 0], axis=2,
-                          name="trim_gt_images")
+    gt_isolated_images = tf.gather(gt_isolated_images,
+                                   tf.where(non_zeros)[:, 0], axis=2,
+                                   name="trim_gt_images")
 
     # Compute overlaps matrix [proposals, gt_boxes]
     overlaps = overlaps_graph(proposals, gt_boxes)
@@ -639,9 +639,10 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes,
 
     # Assign positive ROIs to GT masks
     # Permute masks to [N, height, width, 1]
-    transposed_images = tf.expand_dims(tf.transpose(gt_images, [2, 0, 1]), -1)
+    transposed_images = tf.expand_dims(
+        tf.transpose(gt_isolated_images, [2, 0, 1]), -1)
     # Pick the right mask for each ROI
-    roi_images = tf.gather(transposed_images, roi_gt_assignment)
+    roi_isolated_images = tf.gather(transposed_images, roi_gt_assignment)
 
     # Append negative ROIs and pad bbox deltas and masks that
     # are not used for negative ROIs with zeros.
@@ -650,8 +651,9 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes,
     P = tf.maximum(config.TRAIN_ROIS_PER_IMAGE - tf.shape(rois)[0], 0)
     rois = tf.pad(rois, [(0, P), (0, 0)])
     roi_gt_class_ids = tf.pad(roi_gt_class_ids, [(0, N + P)])
-    roi_images = tf.pad(roi_images, [[0, N + P], (0, 0), (0, 0)])
-    return rois, roi_gt_class_ids, roi_images
+    roi_isolated_images = tf.pad(roi_isolated_images,
+                                 [[0, N + P], (0, 0), (0, 0)])
+    return rois, roi_gt_class_ids, roi_isolated_images
 
 
 class DetectionTargetLayer(KE.Layer):
@@ -684,13 +686,13 @@ class DetectionTargetLayer(KE.Layer):
         proposals = inputs[0]
         gt_class_ids = inputs[1]
         gt_boxes = inputs[2]
-        gt_images = inputs[3]
+        gt_isolated_images = inputs[3]
 
         # Slice the batch and run a graph for each slice
         # TODO: Rename target_bbox to target_deltas for clarity
         names = ["rois", "target_class_ids", "target_image"]
         outputs = utils.batch_slice(
-            [proposals, gt_class_ids, gt_boxes, gt_images],
+            [proposals, gt_class_ids, gt_boxes, gt_isolated_images],
             lambda w, x, y, z: detection_targets_graph(
                 w, x, y, z, self.config),
             self.config.IMAGES_PER_GPU, names=names)
@@ -1301,19 +1303,6 @@ def build_detection_targets(rpn_rois, gt_class_ids, gt_boxes, config):
         rois[pos_ids], roi_gt_boxes[pos_ids, :4])
     # Normalize bbox refinements
     bboxes /= config.BBOX_STD_DEV
-
-    for i in pos_ids:
-        class_id = roi_gt_class_ids[i]
-        assert class_id > 0, "class id must be greater than 0"
-        gt_id = roi_gt_assignment[i]
-
-        if config.USE_MINI_MASK:
-            # GT box
-            gt_y1, gt_x1, gt_y2, gt_x2 = gt_boxes[gt_id]
-            gt_w = gt_x2 - gt_x1
-            gt_h = gt_y2 - gt_y1
-        # Pick part of the mask and resize it
-        y1, x1, y2, x2 = rois[i].astype(np.int32)
     return rois, roi_gt_class_ids, bboxes
 
 
@@ -1547,6 +1536,9 @@ def data_generator(dataset, config, shuffle=True, augment=False,
                 (batch_size, config.MAX_GT_INSTANCES), dtype=np.int32)
             batch_gt_boxes = np.zeros(
                 (batch_size, config.MAX_GT_INSTANCES, 4), dtype=np.int32)
+            batch_gt_isolated_images = np.zeros(
+                (batch_size, config.MAX_GT_INSTANCES)+tuple(config.IMAGE_SHAPE),
+                dtype=np.float32)
             if random_rois:
                 batch_rpn_rois = np.zeros(
                     (batch_size, random_rois, 4), dtype=np.int32)
@@ -1563,7 +1555,8 @@ def data_generator(dataset, config, shuffle=True, augment=False,
                         (batch_size,) + mrcnn_bbox_shape,
                         dtype=np.float32)
 
-            images, gt_boxes, gt_class_ids = dataset.load_input()
+            images, gt_isolated_images, gt_boxes, gt_class_ids =\
+                dataset.load_input()
             for b in range(batch_size):
                 # RPN Targets
                 rpn_match, rpn_bbox = build_rpn_targets(
@@ -1587,6 +1580,7 @@ def data_generator(dataset, config, shuffle=True, augment=False,
                         replace=False)
                     gt_class_ids[b] = gt_class_ids[b][ids]
                     gt_boxes[b] = gt_boxes[b][ids]
+                    gt_isolated_images[b] = gt_isolated_images[b][ids]
 
                 # Add to batch
                 batch_image_shape[b] = images[b].shape
@@ -1595,6 +1589,7 @@ def data_generator(dataset, config, shuffle=True, augment=False,
                 batch_images[b] = images[b].astype(np.float32)
                 batch_gt_class_ids[b, :gt_class_ids[b].shape[0]] = gt_class_ids[b]
                 batch_gt_boxes[b, :gt_boxes[b].shape[0]] = gt_boxes[b]
+                batch_gt_isolated_images[b] = gt_isolated_images[b]
                 if random_rois:
                     batch_rpn_rois[b] = rpn_rois
                     if detection_targets:
@@ -1602,7 +1597,8 @@ def data_generator(dataset, config, shuffle=True, augment=False,
                         batch_mrcnn_class_ids[b] = mrcnn_class_ids
                         batch_mrcnn_bbox[b] = mrcnn_bbox
             inputs = [batch_images, batch_image_shape, batch_rpn_match,
-                      batch_rpn_bbox, batch_gt_class_ids, batch_gt_boxes]
+                      batch_rpn_bbox, batch_gt_class_ids, batch_gt_boxes,
+                      batch_gt_isolated_images]
             outputs = []
             if random_rois:
                 inputs.extend([batch_rpn_rois])
@@ -1778,7 +1774,7 @@ class MaskRCNN():
             # Subsamples proposals and generates target outputs for training
             # Note that proposal class IDs, gt_boxes are zero
             # padded. Equally, returned rois and targets are zero padded.
-            rois, target_class_ids, target_image =\
+            rois, target_class_ids, target_isolated_images =\
                 DetectionTargetLayer(config, name="proposal_targets")([
                     target_rois, input_gt_class_ids, gt_boxes])
 
@@ -1805,7 +1801,7 @@ class MaskRCNN():
                 lambda x: mrcnn_class_loss_graph(*x), name="mrcnn_class_loss")(
                     [target_class_ids, mrcnn_class_logits])
             separator_loss = KL.Lambda(lambda x: mrcnn_separator_loss_graph(*x), name="mrcnn_separator_loss")(
-                [target_image, target_class_ids, mrcnn_image])
+                [target_isolated_images, target_class_ids, mrcnn_image])
             # Model
             inputs = [input_image, input_image_shape,
                       input_rpn_match, input_rpn_bbox, input_gt_class_ids,
@@ -2372,6 +2368,8 @@ class MaskRCNN():
 ############################################################
 #  Miscellenous Graph Functions
 ############################################################
+
+
 def trim_zeros_graph(boxes, name=None):
     """Often boxes are represented with matrices of shape [N, 4] and
     are padded with zeros. This removes zero boxes.
