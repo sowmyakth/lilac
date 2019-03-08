@@ -476,19 +476,25 @@ class PyramidROIExtract(KE.Layer):
         self.pool_shape = tuple(pool_shape)
 
     def call(self, inputs):
-        # Crop boxes [batch, num_boxes, (y1, x1, y2, x2)] in normalized coords
+        # Extract boxes [batch, num_boxes, (y1, x1, y2, x2)] in normalized coords
         boxes = inputs[0]
-
-        # Image shape
-        image_shape = inputs[1]
 
         # Feature Maps. List of feature maps from different level of the
         # feature pyramid. Each is [batch, height, width, channels]
-        feature_maps = inputs[2:]
+        feature_map = inputs[1]
+
+        level_boxes = tf.stop_gradient(boxes)
+        # convert box to pixel coordinate denormbox!!!!
+        # get values outside box
+        extract_feature =
+        update = tf.zeros(?)
+        extract_feature = tf.scatter_nd_update(
+            extract_feature, level_boxes, Y, name="update" )
 
         roi_level = 2
 
-        # Loop through levels and apply ROI pooling to each. P2 to P5.
+
+
         pooled = []
         box_to_level = []
         for i, level in enumerate(range(2, 6)):
@@ -502,7 +508,7 @@ class PyramidROIExtract(KE.Layer):
             box_to_level.append(ix)
 
             # Stop gradient propogation to ROI proposals
-            level_boxes = tf.stop_gradient(boxes)
+
             pooled.append(tf.image.crop_and_resize(
                 feature_maps[0], level_boxes, box_indices, self.pool_shape,
                 method="bilinear"))
