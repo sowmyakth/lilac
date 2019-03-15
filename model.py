@@ -481,60 +481,15 @@ class PyramidROIExtract(KE.Layer):
 
         # Feature Maps. List of feature maps from different level of the
         # feature pyramid. Each is [batch, height, width, channels]
-        feature_map = inputs[1]
-
-        level_boxes = tf.stop_gradient(boxes)
-        # convert box to pixel coordinate denormbox!!!!
-        # get values outside box
-        extract_feature =
-        update = tf.zeros(?)
-        extract_feature = tf.scatter_nd_update(
-            extract_feature, level_boxes, Y, name="update" )
-
-        roi_level = 2
-
-
-
-        pooled = []
-        box_to_level = []
-        for i, level in enumerate(range(2, 6)):
-            ix = tf.where(tf.equal(roi_level, level))
-            level_boxes = tf.gather_nd(boxes, ix)
-
-            # Box indices for crop_and_resize.
-            box_indices = tf.cast(ix[:, 0], tf.int32)
-
-            # Keep track of which box is mapped to which level
-            box_to_level.append(ix)
-
-            # Stop gradient propogation to ROI proposals
-
-            pooled.append(tf.image.crop_and_resize(
-                feature_maps[0], level_boxes, box_indices, self.pool_shape,
-                method="bilinear"))
-
-        # Pack pooled features into one tensor
-        pooled = tf.concat(pooled, axis=0)
-
-        # Pack box_to_level mapping into one array and add another
-        # column representing the order of pooled boxes
-        box_to_level = tf.concat(box_to_level, axis=0)
-        box_range = tf.expand_dims(tf.range(tf.shape(box_to_level)[0]), 1)
-        box_to_level = tf.concat([tf.cast(box_to_level, tf.int32), box_range],
-                                 axis=1)
-
-        # Rearrange pooled features to match the order of the original boxes
-        # Sort box_to_level by batch then box index
-        # TF doesn't have a way to sort by two columns, so merge them and sort.
-        sorting_tensor = box_to_level[:, 0] * 100000 + box_to_level[:, 1]
-        ix = tf.nn.top_k(sorting_tensor, k=tf.shape(
-            box_to_level)[0]).indices[::-1]
-        ix = tf.gather(box_to_level[:, 2], ix)
-        pooled = tf.gather(pooled, ix)
-
-        # Re-add the batch dimension
-        pooled = tf.expand_dims(pooled, 0)
-        return pooled
+        feature_maps = inputs[1][2]
+        extract_boxes = tf.stop_gradient(boxes)
+        names = ["extracted_features"]
+        extracted_features = utils.batch_slice(
+            [feature_maps, extract_boxes],
+            lambda w, x: utils.extract_with_padding(
+                w, x),
+            self.config.IMAGES_PER_GPU, names=names)
+        return extracted_features
 
     def compute_output_shape(self, input_shape):
         return input_shape[0][:2] + self.pool_shape + (input_shape[2][-1], )
