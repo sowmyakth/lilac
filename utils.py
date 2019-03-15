@@ -28,6 +28,32 @@ COCO_MODEL_URL = "https://github.com/matterport/Mask_RCNN/releases/download/v2.0
 ############################################################
 #  Bounding Boxes
 ############################################################
+def extract_with_padding(image, boxes):
+    """
+    Extarcts values within region deteremined boxes from the input image.
+
+    Function crops box region within image while padding the crop to get the
+    same shape at image, while preserving it's spatial position.
+    Args:
+        boxes: Tensor of shape [num_boxes, 4].
+              boxes are the coordinates of the extracted part
+              box is an array [y1, x1, y2, x2]
+              where [y1, x1] (respectively [y2, x2]) are the coordinates
+              of the botttom left (respectively top right ) part of the image.
+        image: tensor containing the initial image
+    Returns:
+        extracted values of image within boxes with values outside the
+        box set to 0 [num_boxes, image.shape]
+    """
+    extracted = []
+    shape = tf.shape(image)
+    for i in range(boxes.shape[0]):
+        b = boxes[i]
+        crop = tf.ones([b[2] - b[0], b[3] - b[1]])
+        mask = tf.pad(crop, [[b[0], shape[0] - b[2]], [b[1], shape[1] - b[3]]])
+        extracted.append(image*tf.expand_dims(mask, 2))
+    return tf.stack(extracted, axis=0)
+
 
 def extract_bboxes(mask):
     """Compute bounding boxes from masks.
