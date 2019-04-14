@@ -23,8 +23,7 @@ import keras.backend as K
 import keras.layers as KL
 import keras.engine as KE
 import keras.models as KM
-
-from mrcnn import utils
+import utils
 
 # Requires TensorFlow 1.3+ and Keras 2.0.8+.
 from distutils.version import LooseVersion
@@ -471,9 +470,10 @@ class PyramidROIExtract(KE.Layer):
     constructor.
     """
 
-    def __init__(self, pool_shape, **kwargs):
+    def __init__(self, image_shape, batch_size, **kwargs):
         super(PyramidROIExtract, self).__init__(**kwargs)
-        self.pool_shape = tuple(pool_shape)
+        self.image_shape = tuple(image_shape)
+        self.batch_size = batch_size
 
     def call(self, inputs):
         # Extract boxes [batch, num_boxes, (y1, x1, y2, x2)] in normalized coords
@@ -481,18 +481,19 @@ class PyramidROIExtract(KE.Layer):
 
         # Feature Maps. List of feature maps from different level of the
         # feature pyramid. Each is [batch, height, width, channels]
-        feature_maps = inputs[1][2]
+        feature_maps = inputs[1]
         extract_boxes = tf.stop_gradient(boxes)
+        print(extract_boxes[0][0])
         names = ["extracted_features"]
         extracted_features = utils.batch_slice(
-            [feature_maps, extract_boxes],
-            lambda w, x: utils.extract_with_padding(
-                w, x),
-            self.config.IMAGES_PER_GPU, names=names)
+            [feature_maps, extract_boxes, [10]*self.batch_size],  # num_boxes], fix this
+            lambda w, x, y: utils.extract_with_padding(
+                w, x, y),
+            self.batch_size, names=names)
         return extracted_features
 
     def compute_output_shape(self, input_shape):
-        return input_shape[0][:2] + self.pool_shape + (input_shape[2][-1], )
+        return input_shape[0][:2] + self.image_shape + (input_shape[2][-1], )
 
 ############################################################
 #  Detection Target Layer
@@ -537,13 +538,13 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes,
                be zero padded if there are not enough proposals.
     gt_class_ids: [MAX_GT_INSTANCES] int class IDs
     gt_boxes: [MAX_GT_INSTANCES, (y1, x1, y2, x2)] in normalized coordinates.
-    gt_masks: [height, width, MAX_GT_INSTANCES] of boolean type.
+    gt_isolated_images: [height, width, bands, MAX_GT_INSTANCES] of boolean type.
     Returns: Target ROIs and corresponding class IDs, bounding box shifts,
     and masks.
     rois: [TRAIN_ROIS_PER_IMAGE, (y1, x1, y2, x2)] in normalized coordinates
     class_ids: [TRAIN_ROIS_PER_IMAGE]. Integer class IDs. Zero padded.
     deltas: [TRAIN_ROIS_PER_IMAGE, (dy, dx, log(dh), log(dw))]
-    masks: [TRAIN_ROIS_PER_IMAGE, height, width]. Masks cropped to bbox
+    isolated_images: [TRAIN_ROIS_PER_IMAGE, height, width]. Masks cropped to bbox
            boundaries and resized to neural network output size.
     Note: Returned arrays might be zero padded if not enough target ROIs.
     """
@@ -561,7 +562,7 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes,
     gt_class_ids = tf.boolean_mask(gt_class_ids, non_zeros,
                                    name="trim_gt_class_ids")
     gt_isolated_images = tf.gather(gt_isolated_images,
-                                   tf.where(non_zeros)[:, 0], axis=2,
+                                   tf.where(non_zeros)[:, 0], axis=3,
                                    name="trim_gt_images")
 
     # Compute overlaps matrix [proposals, gt_boxes]
@@ -597,24 +598,38 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes,
         false_fn=lambda: tf.cast(tf.constant([]), tf.int64)
     )
     roi_gt_class_ids = tf.gather(gt_class_ids, roi_gt_assignment)
-
+    rois = tf.concat([positive_rois, negative_rois], axis=0)
     # Assign positive ROIs to GT masks
     # Permute masks to [N, height, width, 1]
-    transposed_images = tf.expand_dims(
-        tf.transpose(gt_isolated_images, [2, 0, 1]), -1)
+    #transposed_images = tf.expand_dims(
+    transposed_images = tf.transpose(gt_isolated_images, [3, 0, 1, 2])#, -1)
     # Pick the right mask for each ROI
     roi_isolated_images = tf.gather(transposed_images, roi_gt_assignment)
+    boxes = tf.stop_gradient(positive_rois)
+    print(roi_isolated_images.shape, boxes.shape)
+    isolated_images = roi_isolated_images
+    #isolated_images = []
+    #for i in range(int(config.TRAIN_ROIS_PER_IMAGE * config.ROI_POSITIVE_RATIO)):
+    #    b = boxes[i]
+    #    shape = roi_isolated_images[i].shape[1]
+    #    crop = tf.ones([b[2] - b[0], b[3] - b[1]])
+    #    mask = tf.pad(crop, [[b[0], shape[0] - b[2]], [b[1], shape[1] - b[3]]])
+    #    isolated_images.append(roi_isolated_images[i]*tf.expand_dims(mask, 2))
+    #isolated_images = tf.stack(isolated_images, axis=0)
+    # Remove the extra dimension from masks.
+    #isolated_images = tf.squeeze(isolated_images, axis=4)
 
     # Append negative ROIs and pad bbox deltas and masks that
     # are not used for negative ROIs with zeros.
-    rois = tf.concat([positive_rois, negative_rois], axis=0)
+
     N = tf.shape(negative_rois)[0]
     P = tf.maximum(config.TRAIN_ROIS_PER_IMAGE - tf.shape(rois)[0], 0)
+    print("n.p", N, P)
     rois = tf.pad(rois, [(0, P), (0, 0)])
     roi_gt_class_ids = tf.pad(roi_gt_class_ids, [(0, N + P)])
-    roi_isolated_images = tf.pad(roi_isolated_images,
-                                 [[0, N + P], (0, 0), (0, 0)])
-    return rois, roi_gt_class_ids, roi_isolated_images
+    isolated_images = tf.pad(isolated_images,
+                             [[0, N + P], (0, 0), (0, 0), (0, 0)])
+    return rois, roi_gt_class_ids, isolated_images
 
 
 class DetectionTargetLayer(KE.Layer):
@@ -663,8 +678,8 @@ class DetectionTargetLayer(KE.Layer):
         return [
             (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),  # rois
             (None, 1),  # class_ids
-            (None, self.config.TRAIN_ROIS_PER_IMAGE,
-             self.config.IMAGE_SHAPE[0], self.config.IMAGE_SHAPE[1])  # deltas
+            (None, self.config.TRAIN_ROIS_PER_IMAGE, self.config.IMAGE_SHAPE[0],
+             self.config.IMAGE_SHAPE[1], self.config.IMAGE_SHAPE[2 ])  # masks
         ]
 
     def compute_mask(self, inputs, mask=None):
@@ -965,8 +980,8 @@ def fpn_separator_stage(x, stage_number, train_bn=True):
     return x
 
 
-def fpn_separator_graph(rois, feature_maps,
-                        num_classes, train_bn=True):
+def fpn_separator_graph(rois, feature_maps, image_shape,
+                        batch_size, num_classes, train_bn=True):
     """Builds the computation graph of the feature pyramid network classifier
     and regressor heads.
 
@@ -988,7 +1003,8 @@ def fpn_separator_graph(rois, feature_maps,
     """
     # ROI Pooling
     # Shape: [batch, num_boxes, pool_height, pool_width, channels]
-    x = PyramidROIExtract(name="roi_extract")([rois, feature_maps])     # fix this
+    x = PyramidROIExtract(image_shape, batch_size, name="roi_extract")(
+        [rois, feature_maps[2]])     # fix this
 
     x = fpn_separator_stage(x, 1, train_bn=train_bn)
     x = fpn_separator_stage(x, 2, train_bn=train_bn)
@@ -1637,6 +1653,10 @@ class MaskRCNN():
             # Normalize coordinates
             gt_boxes = KL.Lambda(lambda x: norm_boxes_graph(
                 x, K.shape(input_image)[1:3]))(input_gt_boxes)
+            input_isolated_images = KL.Input(
+                shape=[config.IMAGE_SHAPE[0], config.IMAGE_SHAPE[1],
+                       config.IMAGE_SHAPE[2], None],
+                name="input_gt_masks", dtype=bool)
         elif mode == "inference":
             # Anchors in normalized coordinates
             input_anchors = KL.Input(shape=[None, 4], name="input_anchors")
@@ -1737,7 +1757,8 @@ class MaskRCNN():
             # padded. Equally, returned rois and targets are zero padded.
             rois, target_class_ids, target_isolated_images =\
                 DetectionTargetLayer(config, name="proposal_targets")([
-                    target_rois, input_gt_class_ids, gt_boxes])
+                    target_rois, input_gt_class_ids,
+                    gt_boxes, input_isolated_images])
 
             # Network Heads
             # TODO: verify that this handles zero padded ROIs
@@ -1747,6 +1768,8 @@ class MaskRCNN():
                                      train_bn=config.TRAIN_BN,
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
             mrcnn_image = fpn_separator_graph(rois, mrcnn_feature_maps,
+                                              config.IMAGE_SHAPE,
+                                              config.IMAGES_PER_GPU,
                                               config.NUM_CLASSES,
                                               train_bn=config.TRAIN_BN)
 
@@ -1783,6 +1806,8 @@ class MaskRCNN():
                                      train_bn=config.TRAIN_BN,
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
             mrcnn_image = fpn_separator_graph(rois, mrcnn_feature_maps,
+                                              config.IMAGE_SHAPE,
+                                              config.IMAGES_PER_GPU,
                                               config.NUM_CLASSES,
                                               train_bn=config.TRAIN_BN)
 

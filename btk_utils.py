@@ -9,8 +9,7 @@ from scipy import spatial
 import descwl
 import matplotlib.pyplot as plt
 from astropy.table import vstack
-from mrcnn import utils
-import mrcnn.model_btk_only as model_btk
+import utils, model, config
 
 
 def get_ax(rows=1, cols=1, size=4):
@@ -191,163 +190,6 @@ class LilacDataset(utils.Dataset):
             super(self.__class__).image_reference(self, image_id)
 
 
-def get_random_shift(Args, number_of_objects, maxshift=None):
-    """Returns a random shift from the center in x and y coordinates
-    between 0 and max-shift (in arcseconds).
-    """
-    if not maxshift:
-        maxshift = Args.stamp_size / 10.  # in arcseconds
-    dx = np.random.uniform(-maxshift, maxshift,
-                           size=number_of_objects)
-    dy = np.random.uniform(-maxshift, maxshift,
-                           size=number_of_objects)
-    return dx, dy
-
-
-def resid_sampling_function(Args, catalog):
-    """Randomly picks entries from input catalog that are brighter than 25.3
-    mag in the i band. The centers are randomly distributed within 1/5 of the
-    stamp size.
-    """
-    number_of_objects = 1
-    a = np.hypot(catalog['a_d'], catalog['a_b'])
-    cond = (a <= 1.4) & (a > 0.6)
-    q_bright, = np.where(cond & (catalog['i_ab'] <= 25.3))
-    if np.random.random() >= 0.9:
-        q, = np.where(cond & (catalog['i_ab'] > 25.3) & (catalog['i_ab'] < 28))
-    else:
-        q, = np.where(cond & (catalog['i_ab'] <= 25.3))
-    blend_catalog = vstack([catalog[np.random.choice(q_bright, size=1)],
-                            catalog[np.random.choice(q,
-                                                     size=number_of_objects)]])
-    blend_catalog['ra'], blend_catalog['dec'] = 0., 0.
-    # Add small shift so that center does not perfectly align with stamp center
-    dx, dy = get_random_shift(Args, 1, maxshift=3*Args.pixel_scale)
-    blend_catalog['ra'] += dx
-    blend_catalog['dec'] += dy
-    dr = np.random.uniform(3, 10)*Args.pixel_scale
-    theta = np.random.uniform(0, 360) * np.pi / 180.
-    dx2 = dr * np.cos(theta)
-    dy2 = dr * np.sin(theta)
-    blend_catalog['ra'][1] += dx2
-    blend_catalog['dec'][1] += dy2
-    return blend_catalog
-
-
-def resid_general_sampling_function(Args, catalog):
-    """Randomly picks entries from input catalog that are brighter than 25.3
-    mag in the i band. The centers are randomly distributed within 1/5 of the
-    stamp size.
-    At least one bright galaxy (i<=24) is always selected.
-    """
-    number_of_objects = np.random.randint(0, Args.max_number)
-    a = np.hypot(catalog['a_d'], catalog['a_b'])
-    cond = (a <= 1.4) & (a > 0.6)
-    q_bright, = np.where(cond & (catalog['i_ab'] <= 24))
-    if np.random.random() >= 0.9:
-        q, = np.where(cond & (catalog['i_ab'] < 28))
-    else:
-        q, = np.where(cond & (catalog['i_ab'] <= 25.3))
-    blend_catalog = vstack([catalog[np.random.choice(q_bright, size=1)],
-                            catalog[np.random.choice(q,
-                                                     size=number_of_objects)]])
-    blend_catalog['ra'], blend_catalog['dec'] = 0., 0.
-    # keep number density of objects constant
-    maxshift = Args.stamp_size/30.*number_of_objects**0.5
-    dx, dy = get_random_shift(Args, number_of_objects + 1,
-                              maxshift=maxshift)
-    blend_catalog['ra'] += dx
-    blend_catalog['dec'] += dy
-    # Shift center of all objects so that the blend isn't exactly in the center
-    dx, dy = get_random_shift(Args, 1, maxshift=5*Args.pixel_scale)
-    return blend_catalog
-
-
-def new_sampling_function(Args, catalog):
-    """Randomly picks entries from input catalog that are brighter than 25.3
-    mag in the i band. The centers are randomly distributed within 1/5 of the
-    stamp size.
-    """
-    number_of_objects = np.random.randint(1, Args.max_number)
-    a = np.hypot(catalog['a_d'], catalog['a_b'])
-    cond = (a <= 1.4) & (a > 0.6)
-    q_bright, = np.where(cond & (catalog['i_ab'] <= 25.3))
-    q, = np.where(cond & (catalog['i_ab'] <= 26))
-    blend_catalog = vstack([catalog[np.random.choice(q_bright, size=1)],
-                            catalog[np.random.choice(q, size=number_of_objects)]])
-    blend_catalog['ra'], blend_catalog['dec'] = 0., 0.
-    dx, dy = get_random_shift(Args, number_of_objects + 1)
-    blend_catalog['ra'] += dx
-    blend_catalog['dec'] += dy
-    return blend_catalog
-
-
-def group_sampling_function(Args, catalog, min_group_size=5):
-    """Blends are defined from *groups* of galaxies from the Cat-Sim like
-    catalog previously analyzed with WLD. Function selects galaxies
-    Note: the pre-run WLD images are not used here. We only use the pre-run
-    catalog (in i band) to identify galaxies that belong to a group.
-
-    Randomly picks entries from input catalog that are brighter than 25.3
-    mag in the i band. The centers are randomly distributed within 1/5 of the
-    stamp size.
-    """
-    if not hasattr(Args, 'wld_catalog'):
-        raise Exception(
-            "A pre-run WLD catalog should be input as Args.wld_catalog")
-    else:
-        wld_catalog = Args.wld_catalog
-    group_ids = np.unique(
-        wld_catalog['grp_id'][wld_catalog['grp_size'] >= min_group_size])
-    group_id = np.random.choice(group_ids)
-    ids = wld_catalog['db_id'][wld_catalog['grp_id'] == group_id]
-    blend_catalog = vstack([catalog[catalog['galtileid'] == i] for i in ids])
-    blend_catalog['ra'] -= np.mean(blend_catalog['ra'])
-    blend_catalog['dec'] -= np.mean(blend_catalog['dec'])
-    # convert ra dec from degrees to arcsec
-    blend_catalog['ra'] *= 3600
-    blend_catalog['dec'] *= 3600
-    # Add small shift so that center does not perfectly align with stamp center
-    dx, dy = get_random_shift(Args, 1, maxshift=3*Args.pixel_scale)
-    blend_catalog['ra'] += dx
-    blend_catalog['dec'] += dy
-    # make sure galaxy centers don't lie too close to edge
-    cond1 = np.abs(blend_catalog['ra']) < Args.stamp_size/2. - 3
-    cond2 = np.abs(blend_catalog['dec']) < Args.stamp_size/2. - 3
-    no_boundary = blend_catalog[cond1 & cond2]
-    if len(no_boundary) == 0:
-        return no_boundary
-    # make sure number of galaxies in blend is less than Args.max_number
-    num = min([len(no_boundary), Args.max_number])
-    select = np.random.choice(range(len(no_boundary)), num, replace=False)
-    return no_boundary[select]
-
-
-def basic_selection_function(catalog):
-    """Apply selection cuts to the input catalog"""
-    a = np.hypot(catalog['a_d'], catalog['a_b'])
-    q, = np.where((a <= 2) & (catalog['i_ab'] <= 26))
-    return catalog[q]
-
-
-def resid_obs_conditions(Args, band):
-    """Returns the default observing conditions from the WLD package
-    for a given survey_name and band
-    Args
-        Args: Class containing parameters to generate blends
-        band: filter name to get observing conditions for.
-    Returns
-        survey: WLD survey class with observing conditions.
-    """
-    survey = descwl.survey.Survey.get_defaults(
-        survey_name=Args.survey_name,
-        filter_band=band)
-    survey['zenith_psf_fwhm'] = 0.67
-    survey['exposure_time'] = 5520
-    survey['mirror_diameter'] = 0
-    return survey
-
-
 def make_draw_generator(catalog_name, batch_size, max_number,
                         sampling_function, selection_function=None,
                         wld_catalog=None):
@@ -364,7 +206,7 @@ def make_draw_generator(catalog_name, batch_size, max_number,
         # Load parameters
         param = btk.config.Simulation_params(
             catalog_name, max_number=max_number, stamp_size=25.6,
-            batch_size=batch_size, draw_isolated=False, seed=199)
+            batch_size=batch_size, seed=199)
         if wld_catalog:
             param.wld_catalog = wld_catalog
         print("setting seed", param.seed)
@@ -377,9 +219,88 @@ def make_draw_generator(catalog_name, batch_size, max_number,
             param, catalog, sampling_function)
         # Generates observing conditions
         observing_generator = btk.create_observing_generator.generate(
-            param, resid_obs_conditions)
+            param)
         # Generate images of blends in all the observing bands
         draw_blend_generator = btk.draw_blends.generate(
             param, blend_generator, observing_generator)
         return draw_blend_generator
+
+
+class lilac_btk_model(btk.compute_metrics.Metrics_params):
+    def __init__(self,  model_name, model_path, output_dir,
+                 training=False, new_model_name=None, images_per_gpu=1,
+                 validation_for_training=False, *args, **kwargs):
+        super(lilac_btk_model, self).__init__(*args, **kwargs)
+        self.training = training
+        self.model_path = model_path
+        self.output_dir = output_dir
+        self.validation_for_training = validation_for_training
+        #file_name = "train" + model_name
+        #train = __import__(file_name)
+
+        #class InferenceConfig(train.InputConfig):
+        class InferenceConfig(config.Config):
+            GPU_COUNT = 1
+            IMAGES_PER_GPU = images_per_gpu
+            STEPS_PER_EPOCH = 500  # 200
+            VALIDATION_STEPS = 20
+            IMAGE_MIN_DIM = 128
+            IMAGE_MAX_DIM = 128
+            RPN_ANCHOR_SCALES = (4, 8, 16, 32, 64)
+            MEAN_PIXEL = np.zeros(6)
+            IMAGE_SHAPE = np.array([128, 128, 6])
+            #RPN_BBOX_STD_DEV = np.array([0.1, 0.1, 0.2])
+            #BBOX_STD_DEV = np.array([0.1, 0.1, 0.2])
+            if new_model_name:
+                NAME = new_model_name
+
+        self.config = InferenceConfig()
+        if self.training:
+            self.config.display()
+
+    def make_model(self, catalog_name, count=256,
+                         sampling_function=None, max_number=2,
+                         augmentation=False, norm_val=None,
+                         selection_function=None, wld_catalog=None,
+                         meas_params=None):
+        """Creates dataset and loads model"""
+        # If no user input sampling function then set default function
+        self.draw_generator = make_draw_generator(catalog_name,
+                                                  self.config.BATCH_SIZE,
+                                                  max_number,
+                                                  sampling_function,
+                                                  selection_function,
+                                                  wld_catalog,
+                                                  )
+        self.dataset = LilacDataset(self.draw_generator, norm_val=norm_val,
+                                    augmentation=augmentation)
+        self.dataset.load_data(count=count)
+        self.dataset.prepare()
+        if augmentation:
+            self.config.BATCH_SIZE *= 4
+            self.config.IMAGES_PER_GPU *= 4
+        if self.training:
+            self.model = model.MaskRCNN(mode="training",
+                                            config=self.config,
+                                            model_dir=self.output_dir)
+            if self.validation_for_training:
+                val_meas_generator = make_draw_generator(catalog_name,
+                                                         self.config.BATCH_SIZE,
+                                                         max_number,
+                                                         sampling_function,
+                                                         selection_function,
+                                                         wld_catalog,
+                                                         )
+                self.dataset_val = LilacDataset(val_meas_generator,
+                                                norm_val=norm_val)
+                self.dataset_val.load_data(count=count)
+                self.dataset_val.prepare()
+        else:
+            print(self.config.DETECTION_MIN_CONFIDENCE)
+            self.model = model.MaskRCNN(mode="inference",
+                                            config=self.config,
+                                            model_dir=self.output_dir)
+        if self.model_path:
+            print("Loading weights from ", self.model_path)
+            self.model.load_weights(self.model_path, by_name=True)
 

@@ -6,9 +6,9 @@ import dill
 
 
 # Root directory of the project
-ROOT_DIR = '/home/users/sowmyak/ResidualDetectron'
+ROOT_DIR = '/home/users/sowmyak/lilac'
 # Directory to save logs and trained model
-MODEL_DIR = '/scratch/users/sowmyak/resid/logs'
+MODEL_DIR = '/scratch/users/sowmyak/lilac/logs'
 # path to images
 DATA_PATH = '/scratch/users/sowmyak/data'
 
@@ -21,13 +21,13 @@ def main(Args):
             51.2789974336363, 1038.4760551905683]
     count = 2000  # 40000
     catalog_name = os.path.join(DATA_PATH, 'OneDegSq.fits')
-    new_model_name = "resid_" + Args.model_name + "_btk_2gal"
+    new_model_name = "lilac_" + Args.model_name + "_btk_2gal"
     # Define parameters for mrcnn model with btk here
-    resid_model = btk_utils.Resid_btk_model(
+    resid_model = btk_utils.lilac_btk_model(
         Args.model_name, Args.model_path, MODEL_DIR, training=True,
         new_model_name=new_model_name, images_per_gpu=4)
     # Load parametrs for dataset and load model
-    resid_model.make_resid_model(catalog_name, count=count,
+    resid_model.make_model(catalog_name, count=count,
                                  max_number=2, augmentation=True,
                                  norm_val=norm)
     learning_rate = resid_model.config.LEARNING_RATE/10.
@@ -44,9 +44,9 @@ def main(Args):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', type=str,
+    parser.add_argument('--model_name', type=str, default='basic',
                         help="Name of model to evaluate")
-    parser.add_argument('--model_path', type=str,
+    parser.add_argument('--model_path', type=str, default=None,
                         help="Saved weights of model")
     args = parser.parse_args()
     main(args)

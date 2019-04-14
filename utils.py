@@ -28,7 +28,7 @@ COCO_MODEL_URL = "https://github.com/matterport/Mask_RCNN/releases/download/v2.0
 ############################################################
 #  Bounding Boxes
 ############################################################
-def extract_with_padding(image, boxes):
+def extract_with_padding(image, boxes, num_boxes):
     """
     Extarcts values within region deteremined boxes from the input image.
 
@@ -47,7 +47,7 @@ def extract_with_padding(image, boxes):
     """
     extracted = []
     shape = tf.shape(image)
-    for i in range(boxes.shape[0]):
+    for i in range(num_boxes):
         b = boxes[i]
         crop = tf.ones([b[2] - b[0], b[3] - b[1]])
         mask = tf.pad(crop, [[b[0], shape[0] - b[2]], [b[1], shape[1] - b[3]]])
