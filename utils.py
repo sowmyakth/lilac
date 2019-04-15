@@ -49,6 +49,35 @@ def extract_with_padding(image, boxes, num_boxes):
     shape = tf.shape(image)
     for i in range(num_boxes):
         b = boxes[i]
+        crop = tf.image.crop_to_bounding_box(image, b[0], b[1],
+                                             b[2]-b[0], b[3]-b[1])
+        extract = tf.pad(crop, (b[0], shape[0] - b[2]),
+                         (b[1], shape[1] - b[3]), (0, 0))
+        extracted.append(extract)
+    return tf.stack(extracted, axis=0)
+
+
+def extract_with_padding2(image, boxes, num_boxes):
+    """
+    Extarcts values within region deteremined boxes from the input image.
+
+    Function crops box region within image while padding the crop to get the
+    same shape at image, while preserving it's spatial position.
+    Args:
+        boxes: Tensor of shape [num_boxes, 4].
+              boxes are the coordinates of the extracted part
+              box is an array [y1, x1, y2, x2]
+              where [y1, x1] (respectively [y2, x2]) are the coordinates
+              of the botttom left (respectively top right ) part of the image.
+        image: tensor containing the initial image
+    Returns:
+        extracted values of image within boxes with values outside the
+        box set to 0 [num_boxes, image.shape]
+    """
+    extracted = []
+    shape = tf.shape(image)
+    for i in range(num_boxes):
+        b = boxes[i]
         crop = tf.ones([b[2] - b[0], b[3] - b[1]])
         mask = tf.pad(crop, [[b[0], shape[0] - b[2]], [b[1], shape[1] - b[3]]])
         extracted.append(image*tf.expand_dims(mask, 2))

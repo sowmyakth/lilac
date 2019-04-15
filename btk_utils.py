@@ -1,14 +1,9 @@
 """Contains functions to perform detection, deblending and measurement
     on images with BlendingToolKit(btk).
 """
-import sep
 import btk
 import numpy as np
-import scarlet
-from scipy import spatial
-import descwl
 import matplotlib.pyplot as plt
-from astropy.table import vstack
 import utils, model, config
 
 
