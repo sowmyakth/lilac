@@ -244,6 +244,7 @@ class lilac_btk_model(btk.compute_metrics.Metrics_params):
             RPN_ANCHOR_SCALES = (4, 8, 16, 32, 64)
             MEAN_PIXEL = np.zeros(6)
             IMAGE_SHAPE = np.array([128, 128, 6])
+            EXTRACT_SHAPE = np.array([32, 32])
             #RPN_BBOX_STD_DEV = np.array([0.1, 0.1, 0.2])
             #BBOX_STD_DEV = np.array([0.1, 0.1, 0.2])
             if new_model_name:

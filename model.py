@@ -29,6 +29,7 @@ import utils
 from distutils.version import LooseVersion
 assert LooseVersion(tf.__version__) >= LooseVersion("1.3")
 assert LooseVersion(keras.__version__) >= LooseVersion('2.0.8')
+print("Tensorflow version: " + tf.__version__)
 
 
 ############################################################
@@ -470,10 +471,12 @@ class PyramidROIExtract(KE.Layer):
     constructor.
     """
 
-    def __init__(self, image_shape, batch_size, **kwargs):
+    def __init__(self, extract_shape, batch_size, num_boxes,
+                 **kwargs):
         super(PyramidROIExtract, self).__init__(**kwargs)
-        self.image_shape = tuple(image_shape)
+        self.extract_shape = tuple(extract_shape)
         self.batch_size = batch_size
+        self.num_boxes = num_boxes
 
     def call(self, inputs):
         # Extract boxes [batch, num_boxes, (y1, x1, y2, x2)] in normalized coords
@@ -486,14 +489,16 @@ class PyramidROIExtract(KE.Layer):
         print(extract_boxes[0][0])
         names = ["extracted_features"]
         extracted_features = utils.batch_slice(
-            [feature_maps, extract_boxes, [10]*self.batch_size],  # num_boxes], fix this
-            lambda w, x, y: utils.extract_with_padding(
-                w, x, y),
+            [feature_maps, extract_boxes,
+             [self.num_boxes]*self.batch_size,
+             [self.extract_shape]*self.batch_size],  # num_boxes], fix this
+            lambda w, x, y, z: utils.extract_with_padding(
+                w, x, y, z),
             self.batch_size, names=names)
         return extracted_features
 
     def compute_output_shape(self, input_shape):
-        return input_shape[0][:2] + self.image_shape + (input_shape[2][-1], )
+        return input_shape[0][:2] + self.extract_shape + (input_shape[1][-1], )
 
 ############################################################
 #  Detection Target Layer
@@ -600,16 +605,22 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes,
     roi_gt_class_ids = tf.gather(gt_class_ids, roi_gt_assignment)
     rois = tf.concat([positive_rois, negative_rois], axis=0)
     # Assign positive ROIs to GT masks
-    # Permute masks to [N, height, width, 1]
+    # Permute masks to [N, height, width, channel]
     #transposed_images = tf.expand_dims(
     transposed_images = tf.transpose(gt_isolated_images, [3, 0, 1, 2])#, -1)
     # Pick the right mask for each ROI
     roi_isolated_images = tf.gather(transposed_images, roi_gt_assignment)
     boxes = tf.stop_gradient(positive_rois)
-    print(roi_isolated_images.shape, boxes.shape)
-    isolated_images = roi_isolated_images
-    #isolated_images = []
-    #for i in range(int(config.TRAIN_ROIS_PER_IMAGE * config.ROI_POSITIVE_RATIO)):
+    print("roi", roi_isolated_images.shape, boxes.shape, transposed_images)
+    #isolated_images = roi_isolated_images
+    isolated_images = []
+    for i in range(int(config.TRAIN_ROIS_PER_IMAGE * config.ROI_POSITIVE_RATIO)):
+        isolated_images.append(
+            utils.extract_with_padding(roi_isolated_images[i], positive_rois[i:i+1],
+                                       1, config.IMAGE_SHAPE[:2])[0]
+            )
+    isolated_images = tf.stack(isolated_images, axis=0)
+    print("iso", isolated_images)
     #    b = boxes[i]
     #    shape = roi_isolated_images[i].shape[1]
     #    crop = tf.ones([b[2] - b[0], b[3] - b[1]])
@@ -629,6 +640,7 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes,
     roi_gt_class_ids = tf.pad(roi_gt_class_ids, [(0, N + P)])
     isolated_images = tf.pad(isolated_images,
                              [[0, N + P], (0, 0), (0, 0), (0, 0)])
+    print("iso", isolated_images.shape)
     return rois, roi_gt_class_ids, isolated_images
 
 
@@ -678,8 +690,7 @@ class DetectionTargetLayer(KE.Layer):
         return [
             (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),  # rois
             (None, 1),  # class_ids
-            (None, self.config.TRAIN_ROIS_PER_IMAGE, self.config.IMAGE_SHAPE[0],
-             self.config.IMAGE_SHAPE[1], self.config.IMAGE_SHAPE[2 ])  # masks
+            (None, self.config.TRAIN_ROIS_PER_IMAGE) + self.config.IMAGE_SHAPE[0:3]  # masks
         ]
 
     def compute_mask(self, inputs, mask=None):
@@ -980,8 +991,8 @@ def fpn_separator_stage(x, stage_number, train_bn=True):
     return x
 
 
-def fpn_separator_graph(rois, feature_maps, image_shape,
-                        batch_size, num_classes, train_bn=True):
+def fpn_separator_graph(rois, feature_maps, extract_shape,
+                        batch_size, num_classes, num_rois, train_bn=True):
     """Builds the computation graph of the feature pyramid network classifier
     and regressor heads.
 
@@ -1003,7 +1014,7 @@ def fpn_separator_graph(rois, feature_maps, image_shape,
     """
     # ROI Pooling
     # Shape: [batch, num_boxes, pool_height, pool_width, channels]
-    x = PyramidROIExtract(image_shape, batch_size, name="roi_extract")(
+    x = PyramidROIExtract(extract_shape, batch_size, num_rois, name="roi_extract")(
         [rois, feature_maps[2]])     # fix this
 
     x = fpn_separator_stage(x, 1, train_bn=train_bn)
@@ -1150,7 +1161,7 @@ def mrcnn_separator_loss_graph(target_image, target_class_ids, pred_image):
     # Gather the masks (predicted and true) that contribute to loss
     y_true = tf.gather(target_image, positive_ix)
     y_pred = tf.gather_nd(pred_image, indices)
-
+    print(y_true, y_pred)
     # Compute binary cross entropy. If no positive ROIs, then return 0.
     # shape: [batch, roi, num_classes]
     loss = l2_loss(y_true, y_pred)
@@ -1768,9 +1779,10 @@ class MaskRCNN():
                                      train_bn=config.TRAIN_BN,
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
             mrcnn_image = fpn_separator_graph(rois, mrcnn_feature_maps,
-                                              config.IMAGE_SHAPE,
+                                              config.EXTRACT_SHAPE,
                                               config.IMAGES_PER_GPU,
                                               config.NUM_CLASSES,
+                                              config.TRAIN_ROIS_PER_IMAGE,
                                               train_bn=config.TRAIN_BN)
 
             # TODO: clean up (use tf.identify if necessary)

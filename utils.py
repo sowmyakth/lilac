@@ -28,7 +28,7 @@ COCO_MODEL_URL = "https://github.com/matterport/Mask_RCNN/releases/download/v2.0
 ############################################################
 #  Bounding Boxes
 ############################################################
-def extract_with_padding(image, boxes, num_boxes):
+def extract_with_padding(image, boxes, num_boxes, image_shape):
     """
     Extarcts values within region deteremined boxes from the input image.
 
@@ -40,19 +40,28 @@ def extract_with_padding(image, boxes, num_boxes):
               box is an array [y1, x1, y2, x2]
               where [y1, x1] (respectively [y2, x2]) are the coordinates
               of the botttom left (respectively top right ) part of the image.
-        image: tensor containing the initial image
+        image: tensor containing the initial image [height, width, channels]
     Returns:
         extracted values of image within boxes with values outside the
         box set to 0 [num_boxes, image.shape]
     """
     extracted = []
-    shape = tf.shape(image)
     for i in range(num_boxes):
         b = boxes[i]
-        crop = tf.image.crop_to_bounding_box(image, b[0], b[1],
-                                             b[2]-b[0], b[3]-b[1])
-        extract = tf.pad(crop, (b[0], shape[0] - b[2]),
-                         (b[1], shape[1] - b[3]), (0, 0))
+        height = tf.cast(b[2]*image_shape[1]-b[0]*image_shape[1],
+                         tf.int32)
+        width = tf.cast(b[3]*image_shape[0]-b[1]*image_shape[0],
+                        tf.int32)
+        y0 = tf.cast(b[0]*image_shape[1], tf.int32)
+        x0 = tf.cast(b[1]*image_shape[0], tf.int32)
+        y1 = tf.cast(b[2]*image_shape[1], tf.int32)
+        x1 = tf.cast(b[3]*image_shape[0], tf.int32)
+
+        crop = tf.image.crop_to_bounding_box(tf.expand_dims(image, 0), y0, x0,
+                                             height,
+                                             width)[0]
+        extract = tf.pad(crop, [(y0, tf.cast(image_shape[1] - y1, tf.int32)),
+                         (x0, tf.cast(image_shape[0] - x1, tf.int32)), (0, 0)])
         extracted.append(extract)
     return tf.stack(extracted, axis=0)
 
